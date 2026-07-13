@@ -20,4 +20,5 @@ world bridge {
 
     export sqlite:extension/metadata@1.0.0;
     export sqlite:extension/scalar-function@1.0.0;
+    export sqlite:extension/vtab@1.0.0;
 }

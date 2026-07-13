@@ -15,11 +15,13 @@ use bindings::exports::sqlite::extension::metadata::{
     Guest as MetadataGuest, Manifest, ScalarFunctionSpec,
 };
 use bindings::exports::sqlite::extension::scalar_function::Guest as ScalarFunctionGuest;
+use bindings::exports::sqlite::extension::vtab::{Guest as VtabGuest, IndexInfo, IndexPlan, VtabRow};
+use bindings::exports::sqlite::extension::metadata::VtabSpec;
 use bindings::sqlite::extension::types::{FunctionFlags, SqlValue};
 
 use bindings::compose::dynlink::linker;
 
-const PROVIDER_ID: &str = "timescale_core-composed";
+const PROVIDER_ID: &str = "timescale_meta-composed";
 const EXTENSION_ROOT: &str = "timescale";
 const CATALOG_EXTENSION: &str = "timescaledb";
 const CATALOG_VERSION: &str = "2.19.0";
@@ -238,13 +240,15 @@ impl MetadataGuest for Component {
     fn describe() -> Manifest {
         let scalar_functions: Vec<ScalarFunctionSpec> = vec![
         ];
+        let vtabs: Vec<VtabSpec> = vec![
+        ];
         Manifest {
             name: EXTENSION_ROOT.to_string(),
             version: CATALOG_VERSION.to_string(),
             scalar_functions,
             aggregate_functions: vec![],
             collations: vec![],
-            vtabs: vec![],
+            vtabs,
             dot_commands: vec![],
             has_authorizer: false,
             has_update_hook: false,
@@ -284,6 +288,220 @@ impl ScalarFunctionGuest for Component {
             .collect::<Result<Vec<_>, String>>()?;
         let resp = call(&method, cbor_args)?;
         response_to_sqlv(resp)
+    }
+}
+
+
+fn vtab_name_by_id(id: u64) -> Option<&'static str> {
+    match id {
+        _ => None,
+    }
+}
+
+// Per-cursor state: buffered result rows + current position.
+// Keyed by (vtab_id, cursor_id) since cursor ids may collide
+// across vtabs in the host's per-instance allocation strategy.
+fn cursor_state()
+    -> &'static std::sync::Mutex<std::collections::HashMap<(u64, u64), (Vec<Vec<u8>>, usize)>>
+{
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(u64, u64), (Vec<Vec<u8>>, usize)>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+impl VtabGuest for Component {
+    fn create(
+        vtab_id: u64,
+        instance_id: u64,
+        db_name: String,
+        table_name: String,
+        args: Vec<String>,
+    ) -> Result<String, String> {
+        // Eponymous vtabs (which is all we advertise) see only
+        // connect(). Fall through so a caller who does hit create()
+        // gets the same schema.
+        <Self as VtabGuest>::connect(vtab_id, instance_id, db_name, table_name, args)
+    }
+
+    fn connect(
+        vtab_id: u64,
+        _instance_id: u64,
+        _db_name: String,
+        _table_name: String,
+        _args: Vec<String>,
+    ) -> Result<String, String> {
+        // Per-vtab CREATE TABLE schema. Each arm was emitted from
+        // the shim-interface DB's `table_functions.output_columns_json`
+        // + `param_types_json.len()` — real output column names +
+        // affinities, hidden slot per positional argv. The final `_`
+        // arm covers vtab ids the manifest never advertised (unknown
+        // to this bridge — surface as an error so callers see the
+        // mismatch immediately) and functions whose shim-interface row
+        // predates the B5 `output_columns_json` schema (opaque single-
+        // BLOB fallback with 4 hidden argv slots).
+        match vtab_id {
+            _ => Err(format!("unknown vtab id {}", vtab_id)),
+        }
+    }
+
+    fn destroy(_vtab_id: u64, _instance_id: u64) -> Result<(), String> { Ok(()) }
+    fn disconnect(_vtab_id: u64, _instance_id: u64) -> Result<(), String> { Ok(()) }
+
+    fn best_index(_vtab_id: u64, _instance_id: u64, info: IndexInfo) -> Result<IndexPlan, String> {
+        use bindings::exports::sqlite::extension::vtab::ConstraintUsage;
+        let mut next_argv_idx: i32 = 1;
+        let constraint_usage = info
+            .constraints
+            .iter()
+            .map(|c| {
+                if c.usable {
+                    let ci = ConstraintUsage { argv_index: next_argv_idx, omit: true };
+                    next_argv_idx += 1;
+                    ci
+                } else {
+                    ConstraintUsage { argv_index: 0, omit: false }
+                }
+            })
+            .collect();
+        Ok(IndexPlan {
+            constraint_usage,
+            idx_num: 0,
+            idx_str: None,
+            estimated_cost: 1.0,
+            estimated_rows: 100,
+            orderby_consumed: false,
+        })
+    }
+
+    fn open(_vtab_id: u64, _instance_id: u64, _cursor_id: u64) -> Result<(), String> { Ok(()) }
+
+    fn close(vtab_id: u64, cursor_id: u64) -> Result<(), String> {
+        cursor_state()
+            .lock()
+            .expect("vtab cursor state mutex poisoned")
+            .remove(&(vtab_id, cursor_id));
+        Ok(())
+    }
+
+    fn filter(
+        vtab_id: u64,
+        cursor_id: u64,
+        _idx_num: i32,
+        _idx_str: Option<String>,
+        args: Vec<SqlValue>,
+    ) -> Result<(), String> {
+        let name = vtab_name_by_id(vtab_id)
+            .ok_or_else(|| format!("unknown vtab id {}", vtab_id))?;
+        let canonical = canonical_for(name);
+        let method = canonical.replace('_', "-");
+        let cbor_args: Vec<CborValue> = args
+            .iter()
+            .map(sqlv_to_cbor)
+            .collect::<Result<Vec<_>, String>>()?;
+        let resp = call(&method, cbor_args)?;
+        // Response shape: List of Bytes (one blob per row). Any
+        // other shape → single-row wrapper (best-effort).
+        let rows: Vec<Vec<u8>> = match resp {
+            ResponseValue::List(items) => items
+                .into_iter()
+                .map(|item| match item {
+                    ResponseValue::Bytes(b) => b,
+                    ResponseValue::Null => Vec::new(),
+                    other => {
+                        // Non-blob row → serialise as CBOR so callers
+                        // still see a byte payload.
+                        let mut out = Vec::new();
+                        let _ = ciborium::into_writer(&response_value_to_cbor(other), &mut out);
+                        out
+                    }
+                })
+                .collect(),
+            ResponseValue::Null => Vec::new(),
+            other => {
+                let mut out = Vec::new();
+                let _ = ciborium::into_writer(&response_value_to_cbor(other), &mut out);
+                vec![out]
+            }
+        };
+        cursor_state()
+            .lock()
+            .expect("vtab cursor state mutex poisoned")
+            .insert((vtab_id, cursor_id), (rows, 0));
+        Ok(())
+    }
+
+    fn next(vtab_id: u64, cursor_id: u64) -> Result<(), String> {
+        let mut guard = cursor_state()
+            .lock()
+            .expect("vtab cursor state mutex poisoned");
+        if let Some((_, pos)) = guard.get_mut(&(vtab_id, cursor_id)) {
+            *pos += 1;
+        }
+        Ok(())
+    }
+
+    fn eof(vtab_id: u64, cursor_id: u64) -> bool {
+        let guard = cursor_state()
+            .lock()
+            .expect("vtab cursor state mutex poisoned");
+        match guard.get(&(vtab_id, cursor_id)) {
+            Some((rows, pos)) => *pos >= rows.len(),
+            None => true,
+        }
+    }
+
+    fn column(vtab_id: u64, cursor_id: u64, col: i32) -> Result<SqlValue, String> {
+        let guard = cursor_state()
+            .lock()
+            .expect("vtab cursor state mutex poisoned");
+        let (rows, pos) = guard
+            .get(&(vtab_id, cursor_id))
+            .ok_or_else(|| format!("no cursor state for vtab {}/cursor {}", vtab_id, cursor_id))?;
+        if *pos >= rows.len() {
+            return Err("column past EOF".to_string());
+        }
+        // Column 0 = result BLOB; hidden columns (>=1) round-trip
+        // the argv back as-is (the query planner already bound them).
+        if col == 0 {
+            Ok(SqlValue::Blob(rows[*pos].clone()))
+        } else {
+            Ok(SqlValue::Null)
+        }
+    }
+
+    fn rowid(vtab_id: u64, cursor_id: u64) -> Result<i64, String> {
+        let guard = cursor_state()
+            .lock()
+            .expect("vtab cursor state mutex poisoned");
+        let (_, pos) = guard
+            .get(&(vtab_id, cursor_id))
+            .ok_or_else(|| format!("no cursor state for vtab {}/cursor {}", vtab_id, cursor_id))?;
+        Ok(*pos as i64)
+    }
+
+    fn fetch_batch(
+        _vtab_id: u64,
+        _cursor_id: u64,
+        _max_rows: u32,
+    ) -> Result<Vec<VtabRow>, String> {
+        // Per-vtab opt-in via `vtab-spec.batched = true`. This
+        // bridge advertises `batched: false` for every vtab so the
+        // host never routes here — return the sentinel error the
+        // host's cli trampoline probes for.
+        Err("not implemented".to_string())
+    }
+}
+
+fn response_value_to_cbor(v: ResponseValue) -> CborValue {
+    match v {
+        ResponseValue::Null => CborValue::Null,
+        ResponseValue::Bool(b) => CborValue::Bool(b),
+        ResponseValue::Int(i) => CborValue::Int(i),
+        ResponseValue::Float(f) => CborValue::Float(f),
+        ResponseValue::Text(t) => CborValue::Text(t),
+        ResponseValue::Bytes(b) => CborValue::Bytes(b),
+        ResponseValue::List(items) => CborValue::List(
+            items.into_iter().map(response_value_to_cbor).collect(),
+        ),
     }
 }
 
